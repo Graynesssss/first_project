@@ -1,0 +1,183 @@
+class GetData():
+    
+    def __init__(self,data: list,seq_len: int,device: str):
+        self.data = data
+        self.seq_len = seq_len
+        self.device = device
+    
+    def __getitem__(self,item):
+        return torch.tensor(self.data[item:self.seq_len+item]),torch.tensor(self.data[item+1:self.seq_len+1+item])
+    
+    def __len__(self):
+        return len(self.data) - self.seq_len - 1
+
+
+class GPT(nn.Module):
+    
+    def __init__(self,vocab_size: int,max_seq_len: int,emb_size: int,num_heads: int,head_size: int,num_layers: int,dropout: float = 0.1,device: str = 'cpu'):
+        super().__init__()
+        self.device = device
+        self.max_seq_len = max_seq_len
+        self.t_em = TokenEmbeddings(vocab_size,emb_size)
+        self.pos_em = PositionalEmbeddings(max_seq_len,emb_size)
+        self.drop = nn.Dropout(dropout)
+        self.blocks = nn.Sequential(*[Decoder(num_heads,emb_size
+                                             ,head_size,max_seq_len
+                                             ,dropout) for i in range(num_layers)])
+        self.layer = nn.Linear(emb_size,vocab_size)
+        
+    def forward(self,x):
+        t_em_to_x = self.t_em(x)
+        pos_em_to_x = self.pos_em(x.size(1))
+        emb = self.drop(t_em_to_x + pos_em_to_x)
+        
+        emb = self.blocks(emb)
+            
+        logits = self.layer(emb)
+        return logits
+    
+    def generate(self,x,max_new_tokens: int
+                 ,do_sample: bool,temperature: float = 1.0,
+                 top_k: int = None,top_p: float = None):
+        
+        for i in range(max_new_tokens):
+            
+            end_logit = (self.forward(x[:,-self.max_seq_len:])/temperature)[:,-1,:]
+        
+            if top_k and do_sample:                
+                values, _ = torch.topk(end_logit,dim = 1,k = top_k)
+                threshold = values[:, -1, None]                  
+                end_logit[end_logit < threshold] = float('-inf')                                     
+                
+            if top_p and do_sample:
+                p = torch.softmax(end_logit,-1)                   
+                v,indx = torch.sort(p,dim = -1,descending = True)
+                cum = torch.cumsum(v,dim = -1)
+                mask = cum > top_p
+                mask[..., 0] = 0                    
+                for i in range(3):
+                    end_logit[i][indx[i][mask[i]]] = float('-inf')                
+                               
+            if do_sample:
+                p = torch.softmax(end_logit,-1)
+                token = torch.multinomial(p,num_samples = 1)           
+                x = torch.cat([x,token],1)
+                
+            else:
+                token = torch.argmax(end_logit,dim = 1,keepdim = True)            
+                x = torch.cat([x,token],1)
+                
+        return x
+    
+    def fit(self,train_loader,valid_loader,num_epoch: int,learning_rate: float):
+        
+        opt = optim.Adam(params = self.parameters(),lr = learning_rate)
+        self.to(self.device)
+        loss_f = nn.CrossEntropyLoss()       
+        
+        for _ in range(num_epoch):
+            self.train()
+            
+            for inputs,targets in train_loader:
+                logits = self(inputs)
+                logits = logits.view((-1,logits.size(2)))
+                loss_train = loss_f(logits,targets.flatten())
+                                
+                loss_train.backward()
+                opt.step()
+                opt.zero_grad()
+                
+            self.eval()
+            with torch.no_grad():
+                for inputs,targets in valid_loader:               
+                    logits = self(inputs)
+                    logits = logits.view((-1,logits.size(2)))
+                    loss_val = loss_f(logits,targets.flatten())   
+                                                                                                              
+class Decoder(nn.Module):
+    
+    def __init__(self,num_heads: int,emb_size: int,head_size: int,max_seq_len: int,dropout: float = 0.1):
+        super().__init__()
+        self.mha = MultiHeadAttention(num_heads,emb_size,head_size,max_seq_len,dropout)
+        self.layernorm1 = nn.LayerNorm(emb_size)
+        self.ffn = FeedForward(emb_size,dropout)   
+        self.layernorm2 = nn.LayerNorm(emb_size)
+        
+    def forward(self,x):
+               
+        x = self.layernorm1(x + self.mha(x))
+        x = self.layernorm2(x + self.ffn(x))
+        return x
+
+        
+class MultiHeadAttention(nn.Module):
+    
+    def __init__(self,num_heads: int,emb_size: int,head_size: int,max_seq_len: int,dropout: float = 0.1):
+        super().__init__()
+        self.heads = nn.ModuleList([HeadAttention(emb_size,head_size,max_seq_len) for i in range(num_heads)])
+        self.layer = nn.Linear(head_size*num_heads,emb_size)
+        self.drop = nn.Dropout(dropout)
+        
+    def forward(self,x):
+        o = torch.cat([head(x) for head in self.heads],-1)
+        o = self.layer(o)
+        return self.drop(o)
+
+class HeadAttention(nn.Module):
+    
+    def __init__(self,emb_size: int,head_size: int,max_seq_len: int):
+        super().__init__()
+        self.wk = nn.Linear(emb_size,head_size)
+        self.wq = nn.Linear(emb_size,head_size)
+        self.wv = nn.Linear(emb_size,head_size)
+        self.mask = torch.tril(torch.ones((max_seq_len,max_seq_len)))
+        self.sqrt_head = head_size**0.5
+        
+    def forward(self,x):
+        k = self.wk(x)
+        q = self.wq(x)
+        v = self.wv(x)
+        score = (q @ k.permute(0,2,1))/self.sqrt_head
+        score = score.masked_fill(self.mask[:x.size(1),:x.size(1)] == 0,float('-inf'))
+        w = torch.softmax(score,-1)
+        return w @ v
+
+class FeedForward(nn.Module):
+    
+    def __init__(self,emb_size: int,dropout: float = 0.1):
+        super().__init__()
+        self.layer1 = nn.Linear(emb_size,emb_size*4)
+        self.relu = nn.ReLU(True)
+        self.layer2 = nn.Linear(4*emb_size,emb_size)
+        self.drop = nn.Dropout(dropout)
+        
+    def forward(self,x):
+        x = self.layer1(x)
+        x = self.relu(x)
+        x = self.layer2(x)
+        return self.drop(x)
+
+
+class TokenEmbeddings(nn.Module):
+    
+    def __init__(self,vocab_size: int,emb_size: int):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size,emb_size)
+        
+    def forward(self,x):
+        x = self.emb(x)
+        return x
+
+class PositionalEmbeddings(nn.Module):
+    
+    def __init__(self,max_seq_len: int,emb_size: int):
+        super().__init__()
+        self.emb = nn.Embedding(max_seq_len,emb_size)
+        
+    def forward(self,seq_len):
+        return self.emb(torch.arange(seq_len))
+
+
+
+
+
