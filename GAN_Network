@@ -1,0 +1,146 @@
+import os
+import matplotlib.pyplot as plt
+
+
+import torch
+import torch.nn as nn
+import torchvision.transforms.v2 as tfs
+import torchvision
+import torch.optim as optim
+from tqdm import tqdm
+import torch.utils.data as data
+
+class DigitDataset(data.Dataset):
+
+    def __init__(self,path,train = True,target = 8,transforms = False):
+        data = torchvision.datasets.MNIST(path,download = True,train=train)
+        print(data.data.shape)
+        self.dataset = data.data[data.targets == 8]
+        self.target = target
+        self.lenght = self.dataset.size(0)
+
+        if transforms:
+            self.dataset = transforms(self.dataset).view(-1,1,28,28)
+
+    def __getitem__(self,item):
+        return self.dataset[item],self.target
+
+    def __len__(self):
+        return self.lenght
+
+model_gen = nn.Sequential(nn.Linear(2,512*7*7,bias = False),
+                          nn.ELU(True),
+                          nn.BatchNorm1d(512*7*7),
+                          nn.Unflatten(1,(512,7,7)),
+                          nn.Conv2d(512,356,3,stride = 1,padding ='same',bias = False),
+                          nn.ELU(True),
+                          nn.BatchNorm2d(356),
+                          nn.Conv2d(356, 178,3, stride=1, padding='same',bias = False),
+                          nn.ELU(True),
+                          nn.BatchNorm2d(178),
+                          nn.Conv2d(178, 89,3, stride=1, padding='same',bias = False),
+                          nn.ELU(True),
+                          nn.BatchNorm2d(89),
+                          nn.ConvTranspose2d(89,60,4,stride = 2,padding = 1,bias = False),
+                          nn.ELU(True),
+                          nn.BatchNorm2d(60),
+                          nn.ConvTranspose2d(60, 30, 4, stride=2, padding = 1, bias=False),
+                          nn.ELU(True),
+                          nn.BatchNorm2d(30),
+                          nn.Conv2d(30,1,1,1))
+
+model_dis = nn.Sequential(nn.Conv2d(1,128,5,2,2,bias = False),
+                          nn.ELU(True),
+                          nn.BatchNorm2d(128),
+                          nn.Conv2d(128, 256, 5, 2, 2, bias=False),
+                          nn.ELU(True),
+                          nn.BatchNorm2d(256),
+                          nn.Flatten(),
+                          nn.Linear(256*7*7,1))
+
+epochs = 5
+hidden_size = 2
+batch_size = 20
+lr = 0.01
+
+opt_gen = optim.Adam(params = model_gen.parameters(),lr = lr)
+opt_dis = optim.Adam(params = model_dis.parameters(),lr = lr)
+loss_f = nn.BCEWithLogitsLoss()
+
+targets_0 = torch.zeros((batch_size,1))
+targets_1 = torch.ones((batch_size,1))
+
+transforms = tfs.Compose([tfs.ToImage(),
+                          tfs.ToDtype(dtype = torch.float32,scale = True)
+                          ])
+d_train = DigitDataset(r'C:/datasets/mnist',train = True,target = 8,transforms = transforms)
+train_data = data.DataLoader(d_train,batch_size = batch_size,shuffle = True,drop_last = True)
+
+model_gen.train()
+model_dis.train()
+
+for e in range(epochs):
+
+    loss_mean_gen = 0
+    loss_mean_dis = 0
+    lm_count = 0
+    tqdm_train = tqdm(train_data,leave = True)
+
+    for x_train,y_train in tqdm_train:
+
+        h = torch.normal(mean = torch.zeros((batch_size,hidden_size)),std = torch.ones((batch_size,hidden_size)))
+        img_fake = model_gen(h)
+
+        fake_out = model_dis(img_fake.detach())
+        real_out = model_dis(x_train)
+
+        outputs = torch.cat([real_out,fake_out],dim = 1)
+        targets = torch.cat([targets_1,targets_0],dim = 1)
+        loss_dis = loss_f(outputs,targets)
+
+        loss_dis.backward()
+        opt_dis.step()
+        opt_dis.zero_grad()
+
+        res = model_dis(img_fake)
+        loss_gen = loss_f(res,targets_1)
+
+        loss_gen.backward()
+        opt_gen.step()
+        opt_gen.zero_grad()
+
+        lm_count += 1
+        loss_mean_gen = 1/lm_count * loss_gen.item() + (1 - 1/lm_count)*loss_mean_gen
+        loss_mean_dis = 1/lm_count * loss_dis.item() + (1 - 1/lm_count)*loss_mean_dis
+
+        tqdm_train.set_description(f"Epoch [{e + 1}/{epochs}], loss_mean_gen={loss_mean_gen:.3f}, loss_mean_dis={loss_mean_dis:.3f}")
+
+
+
+# st = {'loss_gen': loss_gen_lst, 'loss_dis': loss_dis_lst}
+# torch.save(st, 'model_gan_losses.tar')
+
+# st = torch.load('model_gen_mine.tar', weights_only=True)
+# model_gen.load_state_dict(st)
+
+model_gen.eval()
+n = 2
+total = 2*n+1
+
+plt.figure(figsize=(total, total))
+
+num = 1
+for i in range(-n, n+1):
+  for j in range(-n, n+1):
+    ax = plt.subplot(total, total, num)
+    num += 1
+    h = torch.tensor([[1 * i / n, 1 * j / n]], dtype=torch.float32)
+    predict = model_gen(h)
+    predict = predict.detach().squeeze()
+    dec_img = predict.numpy()
+
+    plt.imshow(dec_img, cmap='gray')
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
+
+plt.show()
